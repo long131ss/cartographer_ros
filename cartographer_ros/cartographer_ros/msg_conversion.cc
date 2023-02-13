@@ -25,6 +25,7 @@
 #include "cartographer/transform/proto/transform.pb.h"
 #include "cartographer/transform/transform.h"
 #include "cartographer_ros/time_conversion.h"
+#include "cartographer_ros/navigation_map/occupancy_values.h"
 #include "geometry_msgs/Pose.h"
 #include "geometry_msgs/Quaternion.h"
 #include "geometry_msgs/Transform.h"
@@ -41,6 +42,9 @@
 #include "sensor_msgs/LaserScan.h"
 #include "sensor_msgs/MultiEchoLaserScan.h"
 #include "sensor_msgs/PointCloud2.h"
+#include <tf/transform_datatypes.h>
+
+#include <cartographer_ros/slam_exception.h>
 
 namespace {
 
@@ -82,6 +86,7 @@ using ::cartographer::sensor::LandmarkData;
 using ::cartographer::sensor::LandmarkObservation;
 using ::cartographer::sensor::PointCloudWithIntensities;
 using ::cartographer::transform::Rigid3d;
+using ::cartographer::transform::Rigid2d;
 using ::cartographer_ros_msgs::LandmarkEntry;
 using ::cartographer_ros_msgs::LandmarkList;
 
@@ -140,13 +145,16 @@ LaserScanToPointCloudWithIntensities(const LaserMessageType& msg) {
     CHECK_GT(msg.angle_min, msg.angle_max);
   }
   PointCloudWithIntensities point_cloud;
-  float angle = msg.angle_min;
+  float angle = msg.angle_min; //角度初值
+  //将每个点的距离值转换成坐标值
   for (size_t i = 0; i < msg.ranges.size(); ++i) {
     const auto& echoes = msg.ranges[i];
     if (HasEcho(echoes)) {
       const float first_echo = GetFirstEcho(echoes);
       if (msg.range_min <= first_echo && first_echo <= msg.range_max) {
-        const Eigen::AngleAxisf rotation(angle, Eigen::Vector3f::UnitZ());
+        const Eigen::AngleAxisf rotation(angle, Eigen::Vector3f::UnitZ());//轴角
+        //Eigen::Vector3f::UnitX()为X轴上上面的单位向量,first_echo * Eigen::Vector3f::UnitX()表示长度为 first_echo
+        //方向和X轴同向的向量  
         const cartographer::sensor::TimedRangefinderPoint point{
             rotation * (first_echo * Eigen::Vector3f::UnitX()),
             i * msg.time_increment};
@@ -163,12 +171,15 @@ LaserScanToPointCloudWithIntensities(const LaserMessageType& msg) {
     }
     angle += msg.angle_increment;
   }
+  //将时间戳ros格式转换为cartographer格式 
+  //msg.header.stamp表示ros message下的第一个点的时间戳
   ::cartographer::common::Time timestamp = FromRos(msg.header.stamp);
   if (!point_cloud.points.empty()) {
+    //从上面可以看到i * msg.time_increment,可以知道time表示的是相对时间
     const double duration = point_cloud.points.back().time;
-    timestamp += cartographer::common::FromSeconds(duration);
+    timestamp += cartographer::common::FromSeconds(duration);//将ros maessage下的最后一个点的时间戳,作为cartographer点云的时间戳
     for (auto& point : point_cloud.points) {
-      point.time -= duration;
+      point.time -= duration; //这里表示相对时间最后一个点的time相对时间是0,前面的点相对时间都是负的
     }
   }
   return std::make_tuple(point_cloud, timestamp);
@@ -294,18 +305,70 @@ Rigid3d ToRigid3d(const geometry_msgs::TransformStamped& transform) {
                  ToEigen(transform.transform.rotation));
 }
 
+Rigid3d ToRigid3d(const geometry_msgs::Point& point) {
+  return Rigid3d(ToEigen(point), Rigid3d::Quaternion::Identity());
+}
+
+Rigid3d ToRigid3d(const geometry_msgs::Transform& transform) {
+  return Rigid3d(ToEigen(transform.translation),
+                 ToEigen(transform.rotation));
+}
+
 Rigid3d ToRigid3d(const geometry_msgs::Pose& pose) {
   return Rigid3d({pose.position.x, pose.position.y, pose.position.z},
                  ToEigen(pose.orientation));
+}
+
+Rigid3d ToRigid3d(const geometry_msgs::Pose2D& pose) {
+  return Rigid3d({pose.x, pose.y, 0},
+                 ToEigen(pose.theta));
+}
+
+Rigid3d ToRigid3d(const tf::Transform transform) {
+  return Rigid3d(ToEigen(transform.getOrigin()),
+                 ToEigen(transform.getRotation()));
+}
+
+Rigid2d ToRigid2d(const geometry_msgs::Pose& pose) {
+  return Rigid2d({pose.position.x, pose.position.y},
+                 ToRotation2D(pose.orientation));
+}
+
+::cartographer::transform::Rigid2d::Rotation2D ToRotation2D(const geometry_msgs::Quaternion& q) {
+  return ::cartographer::transform::Rigid2d::Rotation2D(tf::getYaw(q));
 }
 
 Eigen::Vector3d ToEigen(const geometry_msgs::Vector3& vector3) {
   return Eigen::Vector3d(vector3.x, vector3.y, vector3.z);
 }
 
+Eigen::Vector3d ToEigen(const geometry_msgs::Point& point) {
+  return Eigen::Vector3d(point.x, point.y, point.z);
+}
+
+Eigen::Vector3d ToEigen(const tf::Vector3 vector3) {
+  return Eigen::Vector3d(vector3.getX(), vector3.getY(), vector3.getZ());
+}
+
 Eigen::Quaterniond ToEigen(const geometry_msgs::Quaternion& quaternion) {
   return Eigen::Quaterniond(quaternion.w, quaternion.x, quaternion.y,
                             quaternion.z);
+}
+
+Eigen::Quaterniond ToEigen(const tf::Quaternion& quaternion) {
+  return Eigen::Quaterniond(quaternion.getW(), quaternion.getX(), quaternion.getY(),
+                            quaternion.getZ());
+}
+
+Eigen::Quaterniond ToEigen(const float yaw) {
+  return cartographer::transform::RollPitchYaw(0.0, 0.0, yaw);
+}
+
+tf::Transform ToTFMsg(const Rigid3d& rigid3d) {
+  tf::Transform transform;
+  transform.setOrigin({rigid3d.translation().x(), rigid3d.translation().y(), rigid3d.translation().z()});
+  transform.setRotation(tf::Quaternion(rigid3d.rotation().x(), rigid3d.rotation().y(), rigid3d.rotation().z(), rigid3d.rotation().w()));
+  return transform;
 }
 
 geometry_msgs::Transform ToGeometryMsgTransform(const Rigid3d& rigid3d) {
@@ -404,13 +467,23 @@ std::unique_ptr<nav_msgs::OccupancyGrid> CreateOccupancyGridMsg(
       const uint32_t packed = pixel_data[y * width + x];
       const unsigned char color = packed >> 16;
       const unsigned char observed = packed >> 8;
-      const int value =
-          observed == 0
-              ? -1
-              : ::cartographer::common::RoundToInt((1. - color / 255.) * 100.);
-      CHECK_LE(-1, value);
-      CHECK_GE(100, value);
-      occupancy_grid->data.push_back(value);
+      const unsigned char last_byte = (packed & 0xFF);
+      // The last byte is set to 0 by 'DrawTexture' function,
+      // therefore, the traversability is 0 unless told otherwise
+      // by 'DrawOnMap' function.
+      if (last_byte != 0) {
+        const int traversability =
+            CategoryToOccupancyValue(last_byte);
+        occupancy_grid->data.push_back(traversability);
+      } else {
+        const int value =
+            observed == 0
+            ? -1
+            : ::cartographer::common::RoundToInt((1. - color / 255.) * 100.);
+        CHECK_LE(-1, value);
+        CHECK_GE(100, value);
+        occupancy_grid->data.push_back(value);
+      }
     }
   }
 
